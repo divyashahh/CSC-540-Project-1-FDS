@@ -1,10 +1,12 @@
 # CSC-540-Project-1-FDS
 
 ### Setup
+
+```
 CSC540_FinalProject_FDS/
-├── README.txt
+├── README.md
 ├── .gitignore
-├── config.example.py       # host/user/db placeholders
+├── config_example.py       # host/user/db placeholders
 ├── config.py               # your real password (DO NOT commit)
 ├── sql/
 │   ├── schema.sql          # 1. tables, constraints, views, triggers, 
@@ -19,3 +21,10 @@ CSC540_FinalProject_FDS/
     ├── er_diagram_final.pdf
     ├── report_deliverable1.pdf
     └── report_final.pdf
+```
+
+### Members
+* Divya Shah - dbshah5
+* Lasya Banka - lbanka
+* Madhu Gopinath - mgopina
+* Nimra Shaik - nshaik2
