@@ -1,4 +1,4 @@
-# CSC-540-Project-1-FDS
+# CSC_540_Project_1_FDS
 
 ### Setup
 
