@@ -2,24 +2,24 @@
 --
 -- account_id and username are separate: username is just the login name (placeholders below;
 -- password for all: password123).
--- NOT IN THE SAMPLE (placeholders): hub.address (city, state), usernames/passwords,
+-- NOT IN THE SAMPLE (placeholders): usernames/passwords,
 -- booking.booked_at (noon the day before departure).
 -- Not stored on purpose: the "Carrier" column of DEPARTURES (derivable via vehicle.carrier_id).
 -- shipment.current_status / delivery_outcome are NOT inserted; the scan triggers set them.
 
 -- ---------- Hubs ----------
-INSERT INTO hub (hub_id, hub_name, address, region) VALUES
-('RDU', 'Raleigh Hub',     'Raleigh, NC',     'Southeast'),
-('ATL', 'Atlanta Hub',     'Atlanta, GA',     'Southeast'),
-('MIA', 'Miami Hub',       'Miami, FL',       'Southeast'),
-('JFK', 'New York Hub',    'New York, NY',    'Northeast'),
-('BOS', 'Boston Hub',      'Boston, MA',      'Northeast'),
-('ORD', 'Chicago Hub',     'Chicago, IL',     'Midwest'),
-('STL', 'St. Louis Hub',   'St. Louis, MO',   'Midwest'),
-('DFW', 'Dallas Hub',      'Dallas, TX',      'Southwest'),
-('PHX', 'Phoenix Hub',     'Phoenix, AZ',     'Southwest'),
-('LAX', 'Los Angeles Hub', 'Los Angeles, CA', 'West'),
-('SEA', 'Seattle Hub',     'Seattle, WA',     'West');
+INSERT INTO hub (hub_id, hub_name, region) VALUES
+('RDU', 'Raleigh Hub',     'Southeast'),
+('ATL', 'Atlanta Hub',     'Southeast'),
+('MIA', 'Miami Hub',       'Southeast'),
+('JFK', 'New York Hub',    'Northeast'),
+('BOS', 'Boston Hub',      'Northeast'),
+('ORD', 'Chicago Hub',     'Midwest'),
+('STL', 'St. Louis Hub',   'Midwest'),
+('DFW', 'Dallas Hub',      'Southwest'),
+('PHX', 'Phoenix Hub',     'Southwest'),
+('LAX', 'Los Angeles Hub', 'West'),
+('SEA', 'Seattle Hub',     'West');
 
 -- ---------- Accounts (user_account first, then the subtype tables) ----------
 INSERT INTO user_account (account_id, username, password_hash, role) VALUES
@@ -205,14 +205,3 @@ INSERT INTO scan_event (shipment_id, scan_sequence_no, status, hub_id, scan_time
 (23, 2, 'IN_TRANSIT',       'RDU', '2026-02-10 09:10:00'),
 (23, 3, 'OUT_FOR_DELIVERY', 'ATL', '2026-02-13 08:00:00'),
 (23, 4, 'DELIVERED',        'ATL', '2026-02-13 11:00:00');
-
--- ---------- Sanity checks (run by hand) ----------
--- SELECT COUNT(*) FROM scan_event;   -- 69
--- SELECT d.departure_id, SUM(s.weight_kg) AS booked_kg, d.maximum_weight_kg
---   FROM departure d JOIN booking b ON b.departure_id = d.departure_id
---   JOIN shipment s ON s.shipment_id = b.shipment_id
---   GROUP BY d.departure_id, d.maximum_weight_kg;      -- departure 1 = 7500/10000, departure 7 = 2000/2000
--- Once the scan triggers exist, SELECT shipment_id, current_status, delivery_outcome FROM shipment:
---   ON_TIME: shipments 1, 3, 5, 7, 9, 10, 20, 21, 22     LATE: 2, 6, 8, 11, 23
---   no outcome: 4, 12-19 (shipment 14 has no scans, so its status stays NULL)
--- Without the scan triggers, current_status / delivery_outcome stay NULL for every shipment.

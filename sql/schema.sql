@@ -1,22 +1,18 @@
--- 01_schema.sql
--- Freight Tracking and Delivery Management (CSC 540 Project 1), MariaDB 10.5
--- Contains: DROPs, tables + constraints, ISA-enforcement triggers.
--- Run this file first, then 02_sample_data.sql.
---
--- Design notes
---   * Every table is in BCNF (hence 3NF): each non-trivial FD has a key as its determinant.
+-- DROPs, tables + constraints, ISA-enforcement triggers.
+--   * Each non-trivial FD has a key as its determinant.
 --   * ISA hierarchies (user_account -> viewer/shipper/carrier, vehicle -> box_truck/
 --     refrigerated_van/rail_car) are TOTAL + DISJOINT. The discriminator (role / vehicle_type)
---     lives only on the supertype. Subtype tables carry no copy of it, so no extra FD is created.
---     Disjointness and type-matching are enforced by the triggers at the bottom of this file.
---   * Total participation (every account/vehicle must have a subtype row) cannot be declared in
---     SQL; it is enforced in application code (create account/vehicle + subtype row together).
+--     lives only on the supertype.
+--     Disjointness and type-matching are enforced by the triggers.
 --   * shipment.current_status is NULL until the first scan arrives.
 
 -- =========================================================
--- DROP (reverse dependency order; dropping a table also drops its triggers)
+-- DROP
 -- =========================================================
 
+DROP VIEW IF EXISTS v_departure_load;
+DROP PROCEDURE IF EXISTS book_shipment;
+DROP FUNCTION IF EXISTS scan_status_rank;
 DROP TABLE IF EXISTS scan_event;
 DROP TABLE IF EXISTS booking;
 DROP TABLE IF EXISTS shipment;
@@ -98,7 +94,6 @@ CREATE TABLE carrier (
 CREATE TABLE hub (
     hub_id VARCHAR(3),
     hub_name VARCHAR(100) NOT NULL,
-    address VARCHAR(255) NOT NULL,
     region VARCHAR(20) NOT NULL,
 
     PRIMARY KEY (hub_id),
@@ -427,5 +422,217 @@ END//
 
 DELIMITER ;
 
--- STILL TO ADD to this file: the booking procedure and the two scan triggers
--- (status/late flag, chronology) required by the handout.
+-- =========================================================
+-- VIEW
+-- =========================================================
+
+CREATE VIEW v_departure_load AS
+SELECT d.departure_id,
+       d.vehicle_id,
+       d.origin_hub_id,
+       d.destination_hub_id,
+       d.departure_datetime,
+       d.maximum_weight_kg,
+       COALESCE(SUM(s.weight_kg), 0)                                      AS booked_weight_kg,
+       d.maximum_weight_kg - COALESCE(SUM(s.weight_kg), 0)                AS remaining_kg,
+       ROUND(100 * COALESCE(SUM(s.weight_kg), 0) / d.maximum_weight_kg, 2) AS utilization_pct
+FROM departure d
+LEFT JOIN booking  b ON b.departure_id = d.departure_id
+LEFT JOIN shipment s ON s.shipment_id  = b.shipment_id
+GROUP BY d.departure_id, d.vehicle_id, d.origin_hub_id, d.destination_hub_id,
+         d.departure_datetime, d.maximum_weight_kg;
+ 
+ 
+-- =========================================================
+-- PROCEDURE: book a shipment onto a departure (atomic, capacity-safe)
+--   * One transaction. The departure row is locked (FOR UPDATE), so two concurrent bookings
+--     for the same departure run one after the other and cannot overbook it.
+--   * The booked weight is an aggregate over the existing bookings, not a stored counter.
+--   * Any failure rolls everything back and raises SQLSTATE 45000 with a readable message
+--     (the app just prints it). Success returns one result row.
+--   * Note: START TRANSACTION commits any transaction the caller already had open;
+--     call it with autocommit on (the default) and nothing pending.
+-- =========================================================
+ 
+DELIMITER //
+ 
+CREATE PROCEDURE book_shipment(IN p_shipment_id INT, IN p_departure_id INT)
+BEGIN
+    DECLARE v_ship_weight  DECIMAL(10,2);
+    DECLARE v_ship_origin  VARCHAR(3);
+    DECLARE v_ship_dest    VARCHAR(3);
+    DECLARE v_max_weight   DECIMAL(10,2);
+    DECLARE v_dep_origin   VARCHAR(3);
+    DECLARE v_dep_dest     VARCHAR(3);
+    DECLARE v_booked       DECIMAL(12,2);
+    DECLARE v_msg          VARCHAR(128);
+ 
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+ 
+    START TRANSACTION;
+ 
+    -- lock the shipment row and read it
+    SELECT weight_kg, origin_hub_id, destination_hub_id
+      INTO v_ship_weight, v_ship_origin, v_ship_dest
+      FROM shipment
+     WHERE shipment_id = p_shipment_id
+       FOR UPDATE;
+ 
+    IF v_ship_weight IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Booking rejected: shipment does not exist';
+    END IF;
+ 
+    -- lock the departure row: this is what serializes competing bookings
+    SELECT maximum_weight_kg, origin_hub_id, destination_hub_id
+      INTO v_max_weight, v_dep_origin, v_dep_dest
+      FROM departure
+     WHERE departure_id = p_departure_id
+       FOR UPDATE;
+ 
+    IF v_max_weight IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Booking rejected: departure does not exist';
+    END IF;
+ 
+    IF EXISTS (SELECT 1 FROM booking WHERE shipment_id = p_shipment_id) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Booking rejected: shipment is already booked';
+    END IF;
+ 
+    IF v_ship_origin <> v_dep_origin OR v_ship_dest <> v_dep_dest THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Booking rejected: shipment origin/destination do not match the departure';
+    END IF;
+ 
+    -- aggregate over the existing bookings (not a counter)
+    SELECT COALESCE(SUM(s.weight_kg), 0)
+      INTO v_booked
+      FROM booking b
+      JOIN shipment s ON s.shipment_id = b.shipment_id
+     WHERE b.departure_id = p_departure_id;
+ 
+    IF v_booked + v_ship_weight > v_max_weight THEN
+        SET v_msg = CONCAT('Booking rejected: capacity exceeded (booked ', v_booked,
+                           ' kg + shipment ', v_ship_weight, ' kg > max ', v_max_weight, ' kg)');
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+    END IF;
+ 
+    INSERT INTO booking (shipment_id, departure_id, booked_at)
+    VALUES (p_shipment_id, p_departure_id, NOW());
+ 
+    COMMIT;
+ 
+    SELECT p_shipment_id            AS shipment_id,
+           p_departure_id           AS departure_id,
+           v_booked + v_ship_weight AS booked_weight_kg,
+           v_max_weight             AS maximum_weight_kg,
+           'BOOKED'                 AS result;
+END//
+ 
+ 
+-- =========================================================
+-- Helper: order of scan statuses (used by the chronology trigger).
+-- IN_TRANSIT and ARRIVED_AT_HUB share a rank so a shipment can go
+-- in transit -> arrived at hub -> in transit again over several legs.
+-- =========================================================
+ 
+CREATE FUNCTION scan_status_rank(p_status VARCHAR(30)) RETURNS INT
+DETERMINISTIC
+NO SQL
+BEGIN
+    RETURN CASE p_status
+        WHEN 'RECEIVED'         THEN 1
+        WHEN 'IN_TRANSIT'       THEN 2
+        WHEN 'ARRIVED_AT_HUB'   THEN 2
+        WHEN 'OUT_FOR_DELIVERY' THEN 3
+        WHEN 'DELIVERED'        THEN 4
+    END;
+END//
+ 
+ 
+-- =========================================================
+-- TRIGGER: enforce scan chronology (BEFORE INSERT on scan_event)
+--   1. scan_sequence_no must be exactly previous + 1 (first scan = 1)
+--   2. nothing can be scanned after DELIVERED
+--   3. timestamp cannot predate the shipment's most recent scan
+--   4. status cannot regress (e.g. DELIVERED -> IN_TRANSIT is impossible)
+--   5. DELIVERED requires an earlier IN_TRANSIT scan
+-- =========================================================
+ 
+CREATE TRIGGER trg_scan_chronology
+BEFORE INSERT ON scan_event
+FOR EACH ROW
+BEGIN
+    DECLARE v_last_seq    INT;
+    DECLARE v_last_ts     DATETIME;
+    DECLARE v_last_status VARCHAR(30);
+ 
+    SET v_last_seq = (SELECT MAX(scan_sequence_no)
+                        FROM scan_event
+                       WHERE shipment_id = NEW.shipment_id);
+ 
+    IF v_last_seq IS NULL THEN
+        IF NEW.scan_sequence_no <> 1 THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Scan rejected: the first scan of a shipment must have sequence number 1';
+        END IF;
+    ELSE
+        IF NEW.scan_sequence_no <> v_last_seq + 1 THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Scan rejected: sequence number must be the previous one plus 1';
+        END IF;
+ 
+        SELECT scan_timestamp, status
+          INTO v_last_ts, v_last_status
+          FROM scan_event
+         WHERE shipment_id = NEW.shipment_id
+           AND scan_sequence_no = v_last_seq;
+ 
+        IF v_last_status = 'DELIVERED' THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Scan rejected: shipment is already delivered';
+        END IF;
+ 
+        IF NEW.scan_timestamp < v_last_ts THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Scan rejected: timestamp is earlier than the most recent scan';
+        END IF;
+ 
+        IF scan_status_rank(NEW.status) < scan_status_rank(v_last_status) THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Scan rejected: status cannot go backwards';
+        END IF;
+    END IF;
+ 
+    IF NEW.status = 'DELIVERED'
+       AND NOT EXISTS (SELECT 1 FROM scan_event
+                        WHERE shipment_id = NEW.shipment_id AND status = 'IN_TRANSIT') THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Scan rejected: a shipment cannot be delivered before it has been in transit';
+    END IF;
+END//
+ 
+ 
+-- =========================================================
+-- TRIGGER: keep current_status and flag on-time / late delivery
+-- (AFTER INSERT on scan_event). On time = the DELIVERED scan falls on or
+-- before the end of the promised delivery date (i.e. before the next midnight).
+-- =========================================================
+ 
+CREATE TRIGGER trg_scan_status_outcome
+AFTER INSERT ON scan_event
+FOR EACH ROW
+BEGIN
+    UPDATE shipment
+       SET current_status   = NEW.status,
+           delivery_outcome = CASE
+               WHEN NEW.status <> 'DELIVERED' THEN delivery_outcome
+               WHEN NEW.scan_timestamp < promised_delivery_date + INTERVAL 1 DAY THEN 'ON_TIME'
+               ELSE 'LATE'
+           END
+     WHERE shipment_id = NEW.shipment_id;
+END//
+ 
+DELIMITER ;
